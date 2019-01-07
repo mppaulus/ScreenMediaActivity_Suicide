@@ -1,0 +1,808 @@
+---
+title: "ABCD Media GFA Suicide Analysis 08.31.2018"
+author: "Martin P Paulus"
+date: "8/31/2018"
+output: 
+  html_document:
+    code_folding: hide
+    highlight: tango
+    theme: cerulean
+word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# For Markdown examples look up: https://rmarkdown.rstudio.com/html_document_format.html#overview
+
+# Example Libraries to use:
+library(psych)
+library(tableone)
+library(glmnet)
+library(MASS)
+# This library has glmer.nb - negative binomial fitting
+# Useful example: http://data.library.virginia.edu/getting-started-with-negative-binomial-regression-modeling/
+library(lme4)
+# library(mice)
+library(ggplot2)
+library(gridExtra)
+library(scales)
+library(vcd)
+library(GFA)
+library(Hmisc)
+library(gtools)
+library(RColorBrewer)
+library(corrplot)
+library(data.table)
+library(VIM)
+
+#Wes' Libraries:
+library(plotly)
+library(plotrix)
+library(gamm4)
+
+# Additonal libraries for zero inflated Poisson models:
+library(glmmADMB)
+library(glmmTMB)
+library(coefplot)
+library(sjPlot)
+library(bbmle) #for AICtab
+library(ggstance)
+
+# To produce nice tables:
+# https://cran.r-project.org/web/packages/kableExtra/vignettes/awesome_table_in_html.html
+library(knitr)
+library(kableExtra)
+
+# For simulations
+library(merTools)
+
+# Some useful links:
+# Marginals:
+# https://www.r-bloggers.com/marginal-effects-for-negative-binomial-mixed-effects-models-glmer-nb-and-glmmtmb-rstats/
+# Some concerns with glmer.nb:
+# http://stackoverflow.link/question/40324896/r-glmer-different-results-on-different-machines-non-deterministic
+
+# It looks like the zero-inflated Poisson and negative binomial distributions are implemented
+# as a mixed model in: glmnadmb
+# http://glmmadmb.r-forge.r-project.org/glmmADMB.html
+# 
+# However the following package is more flexible and yields similar results:
+# https://cran.r-project.org/package=glmmTMB
+# An intro can be found here: https://cran.r-project.org/web/packages/glmmTMB/vignettes/glmmTMB.pdf
+
+# Need little Column Standard Deviation formula:
+# colSd <- function (x, na.rm=FALSE) apply(X=x, MARGIN=2, FUN=sd, na.rm=na.rm)
+```
+
+```{r, Logistic Gamm4 Function}
+myGAMM4Bin <- function(dv,iv,cv,nv,dat)
+{
+  
+  indv <- paste(iv, collapse=" + ")
+  cova <- paste(cv, collapse=" + ")
+  if(length(nv)>1){
+    nstv <- paste("~","(","1","|",nv[1],"/",nv[2],")",sep="")
+  } else {
+    nstv <- paste("~","(","1","|",nv[1],")",sep="")
+  }
+  datnames <- names(dat)
+  
+  if(iv %in% datnames) {
+    form1 <- paste(dv," ~ ",indv," + ",cova,sep="")
+  } else { form1 <- paste(dv," ~ ",cova,sep="")}
+  
+  # print(form1)
+  # print(nstv)
+  
+  mygam <- gamm4(as.formula(form1), family=binomial, random = as.formula(nstv), data = dat)
+  
+  return(mygam)
+}
+```
+
+```{r, Zero Inflated glmmTMB routine for different families, echo=FALSE }
+myglmmTMBall <- function(dv,iv,cv,nv,dat,myfamily,myzero)
+{
+# 6/6/2018:
+  # Need to include the possibility for an offset:
+
+indv <- paste(iv, collapse=" + ")
+cova <- paste(cv, collapse=" + ")
+nstv <- paste("(","1","|",nv[1],")",sep="")
+
+datnames <- names(dat)
+
+# total form:
+if(iv %in% datnames) {
+    form1 <- paste(dv," ~ ",indv," + ",cova,sep="")
+} else { form1 <- paste(dv," ~ ",cova,sep="")}
+# form for zeroinflation
+if(iv %in% datnames) {
+    rform <- paste(" ~ ",indv," + ",cova,sep="")
+} else { rform <- paste(" ~ ",cova,sep="")}
+
+# print(form1)
+# print(nstv)
+myform <- paste(form1,"+",nstv,sep=" ")
+rform <- paste(rform,"+",nstv,sep=" ")
+
+# print(rform)
+
+if(myzero == 2){ # parametrically zero inflated
+  myglm <- glmmTMB(as.formula(myform),data = dat,family = myfamily,
+                   ziformula= as.formula(rform))
+  # print("zero coefficients")
+} else if(myzero == 1){ # simple zero inflated
+  myglm <- glmmTMB(as.formula(myform),data = dat,family = myfamily,ziformula=~1)
+} else if(myzero == 0){ # non-zero inflated
+  myglm <- glmmTMB(as.formula(myform),data = dat,family = myfamily,ziformula=~0)
+}
+return(myglm)
+}
+```
+
+```{r, Create a Coefficient Data Frame for a Model, echo=FALSE }
+createCoeftab <- function(mymodel,mymodelname,variablenames,removevars) {
+ # Remove the intercept and the missing education coefficient
+   bModel <- fixef(mymodel)$cond[-removevars]
+  seModel <- diag(vcov(mymodel)$cond)[-removevars]
+  nms <- variablenames
+
+    df <- data.frame(model    = rep(c(mymodelname), each = length(bModel)),
+                     term     = rep(nms, 1),
+                     estimate = unname(c(bModel)),
+                     expestimate = exp(unname(c(bModel))))
+    df$term <- factor(df$term, levels = rev(df$term))
+    
+    df <- transform(df,
+                    upper = estimate + 1.96* sqrt(c(seModel)),
+                    lower = estimate - 1.96* sqrt(c(seModel)),
+                    expupper = exp(estimate + 1.96* sqrt(c(seModel))),
+                    explower = exp(estimate - 1.96* sqrt(c(seModel))))
+    df
+}
+```
+
+```{r, Load supplemental data sets}
+
+mydir <- paste0("/Users/mpaulus/Dropbox (Personal)/Private/RDataAnalysis/ABCD_Data/Media/")
+# File components:
+myfile <- c("ABCD_")
+datatext <-("SMA_CBCL_COG_ENV_")
+GFAtext <- c("R_GFA_")
+dateext <- c("09.02.2018")
+
+myall <- paste(mydir,myfile,datatext,GFAtext,dateext,".RData",sep="")
+load(myall)
+mynames <- names(abcdnegreinf)
+
+# Load different variable sets:
+
+myall <- paste(mydir,"abcd_activars_08.23.2018",".RData",sep="")
+load(myall)
+myall <- paste(mydir,"abcd_cbclvars_08.23.2018",".RData",sep="")
+load(myall)
+myall <- paste(mydir,"abcd_cogvars_08.23.2018",".RData",sep="")
+load(myall)
+myall <- paste(mydir,"abcd_friendvars_08.23.2018",".RData",sep="")
+load(myall)
+myall <- paste(mydir,"abcd_medvars_08.23.2018",".RData",sep="")
+load(myall)
+myall <- paste(mydir,"abcd_sulcvars_08.23.2018",".RData",sep="")
+load(myall)
+myall <- paste(mydir,"abcd_thickvars_08.23.2018",".RData",sep="")
+load(myall)
+myall <- paste(mydir,"abcd_volvars_08.23.2018",".RData",sep="")
+load(myall)
+myall <- paste(mydir,"abcd_screenvars_08.23.2018",".RData",sep="")
+load(myall)
+myall <- paste(mydir,"abcd_socialsummaryvars_08.23.2018",".RData",sep="")
+load(myall)
+myall <- paste(mydir,"abcd_physvars_08.23.2018",".RData",sep="")
+load(myall)
+myall <- paste(mydir,"abcd_covars_08.23.2018",".RData",sep="")
+load(myall)
+myall <- paste(mydir,"abcd_suicidvars_08.23.2018",".RData",sep="")
+load(myall)
+
+# Assigns a temporary data set for computational purposes:
+currdata <- abcdnegreinf
+```
+
+
+```{r Intermediate calculations for variables}
+
+# Rename kids suicide variables:
+
+kidsuicidevars <- suicidvars[intersect(grep("_t",suicidvars),grep("ksads",suicidvars))]
+
+kidsuicidelabels <- c("selfinjurious_now","selfinjurious_past","wishdead_now","wishdead_past",
+                      "SI_present","SI_past","suicideattempt_now","suicideattempt_past",
+                      "selfinjurytodie_now","selfinjurythought_now","suicidethoughtmethod_now",
+                      "suicideintent_now","suicideplan_now","suicideprep_now","suicideabort_now",
+                      "suicidemethod_now","suicideattempt_now","selfinjurytodie_past",
+                      "selfinjurythought_past","suicidethoughtmethod_past","suicideintent_past",
+                      "suicideplan_past","suicideprep_past","suicideabort_past",
+                      "suicidenumber_past","suicidemethod_past","suicideattempt_past")
+
+# Rename the variables:
+setnames(currdata, old=c(kidsuicidevars), new=c(kidsuicidelabels))
+
+# Rename parents suicide variables:
+parsuicidevars <- suicidvars[intersect(grep("_p",suicidvars),grep("ksads",suicidvars))]
+parsuicidevars <- parsuicidevars[-c(1:4)]
+
+parentsuicidelabels <- c("p_suicideAttempt_now","p_suicideAttempt_past","p_selfinjury_now","p_selfinjury_past","p_SImethod_now","p_suicideintent_now","p_suicidePlan_now","p_suicidePrep_now","p_suicudeInterrupt_now","p_suicidemethod_now","p_suicideTought_now","p_selfinjuryDeath_past","p_selfinjuryThought_past","p_SImethod_past","p_suicideintent_past","p_suicidePlan_past","p_suicidePrep_past","p_suicideInterrupt_past","p_numSA_past","p_Samethod_past","p_expectToDie_past")
+
+homicidallabels <- c("p_homicidaldeas_now","p_homicidaldeas_poast","p_homicidalPlan_now","p_homicidalPlan_past")
+
+# Rename the variables:
+setnames(currdata, old=c(parsuicidevars), new=c(parentsuicidelabels))
+
+kidsuicidetotal <- rowSums(currdata[,kidsuicidelabels])
+parsuicidetotal <- rowSums(currdata[,parentsuicidelabels])
+
+currdata$kidsitotal <- c(kidsuicidetotal)
+currdata$parsitotal <- c(parsuicidetotal)
+
+# Create a binary variable
+currdata$KidsSIyes <- ifelse(currdata$kidsitotal>0,1,0)
+currdata$ParSIyes <- ifelse(currdata$parsitotal>0,1,0)
+currdata$KidsSIyes <- as.factor(currdata$KidsSIyes)
+currdata$ParSIyes <- as.factor(currdata$ParSIyes)
+
+# Describe and characterize the total variables
+# individual kids items:
+factordata <- data.frame(lapply(currdata[,kidsuicidelabels], factor))
+describe(factordata[,kidsuicidelabels])
+
+# total item:
+print(describe(currdata$kidsitotal))
+hist(currdata$kidsitotal,main=paste("Histogram of Total Youth Suicid Items"))
+
+# individual parent items:
+factordata <- data.frame(lapply(currdata[,parentsuicidelabels], factor))
+describe(factordata[,parentsuicidelabels])
+
+# Rename some of the variables:
+names(currdata)[names(currdata)=="highest.household.income"] <- "HHInc"
+currdata$HHInc <- factor(currdata$HHInc,levels = c("[<50K]","[>=50K & <100K]","[>=100K]",""))
+levels(currdata$HHInc) <- c("[<50K]","[50K - 100K]","[>100K]","_miss")
+levels(currdata$high.educ) <- c("<= 12 grades","HS Degree","College Degree","Bachelor",
+                                    "Higher","_miss")
+
+# Creating Quartiles of the first 10 Robust GFAs:
+# Alternatively cut by z-scores of the factors < -.5, -.5 - .5, > .5
+myqGFA <- paste0("qGFA",rep(1:8))
+for(i in 1:length(myqGFA)){
+currdata[,myqGFA[i]] <- as.factor(quantcut(currdata[,paste0("SMA_RGFA",i)]))  
+}
+
+```
+
+```{r, Tables of GFA Quartiles, results='asis' }
+
+mynames <- names(currdata)
+
+# General Sample Characteristics:
+# Need to rename the demographic variables:
+demovars <- c("age","female","race.ethnicity","high.educ","married",
+              "HHInc","anthro_1_height_in","anthroweight1lb","demo_prnt_age_v2")
+
+# Additional Screen variables - youth reported hours a week:
+addscreenvars <- mynames[grep("week_y_",mynames)]
+
+listvars <- c(demovars,addscreenvars,"kidsitotal","parsitotal","KidsSIyes","ParSIyes")
+
+tabledata <- currdata[,c(myqGFA,listvars)]
+
+catVars = c("female","race.ethnicity","married","high.educ","HHInc","KidsSIyes","ParSIyes")
+# length(myqGFA)
+for(i in 1: length(myqGFA)){
+mytable1 <- CreateTableOne(vars = listvars,data=tabledata,factorVars=catVars,strata=c(myqGFA[i]))
+
+# Make the Table look nice:
+tabAsStringMatrix <- print(mytable1, printToggle = FALSE, noSpaces = TRUE) 
+print(kable(tabAsStringMatrix, "html",caption = paste0("Quartiles of Robust GFA",i)) %>% kable_styling(bootstrap_options = c( "hover", "condensed", "responsive"),font_size = 11))
+
+}
+
+```
+
+
+```{r, Tables of GFA standard deviations, results='asis' }
+
+# by z-scores of the factors < -.5, -.5 - .5, > .5
+mysdGFA <- paste0("sdGFA",rep(1:8))
+for(i in 1:length(mysdGFA)){
+currdata[,mysdGFA[i]] <- cut(currdata[,paste0("SMA_RGFA",i)], breaks = rep(-2.5:3.5))
+}
+
+mynames <- names(currdata)
+
+# General Sample Characteristics:
+# Need to rename the demographic variables:
+demovars <- c("age","female","race.ethnicity","high.educ","married",
+              "HHInc","anthro_1_height_in","anthroweight1lb","demo_prnt_age_v2")
+
+# Additional Screen variables - youth reported hours a week:
+addscreenvars <- mynames[grep("week_y_",mynames)]
+
+listvars <- c(demovars,addscreenvars,"kidsitotal","parsitotal","KidsSIyes","ParSIyes")
+
+tabledata <- currdata[,c(mysdGFA,listvars)]
+
+catVars = c("female","race.ethnicity","married","high.educ","HHInc","KidsSIyes","ParSIyes")
+# length(myqGFA)
+for(i in 1: length(mysdGFA)){
+mytable1 <- CreateTableOne(vars = listvars,data=tabledata,factorVars=catVars,strata=c(mysdGFA[i]))
+
+# Make the Table look nice:
+tabAsStringMatrix <- print(mytable1, printToggle = FALSE, noSpaces = TRUE) 
+print(kable(tabAsStringMatrix, "html",caption = paste0("Standard Deviations of Robust GFA",i)) %>% kable_styling(bootstrap_options = c( "hover", "condensed", "responsive"),font_size = 11))
+
+}
+
+```
+
+
+```{r, RglmmTMB zero-inflated poisson regression +/- zero coeff, echo=TRUE, eval=TRUE,fig.height = 8, fig.width = 8, warning=FALSE}
+
+# Set up the variables:
+covars <- c("age","female","race.ethnicity","high.educ","married","HHInc","demo_prnt_age_v2")
+colabels <- c("Age","Female","Race: Black","Race: Hispanic","Race: Asian","Race: Other","Parental Education: HS","Parental Education: College","Parental Education: Bachelor","Parental Education: > Bachelor","Married","Household Income: 50-100K","Household Income: > 100K","Household Income: miss","Parental Age")
+
+## Select the nesting variables: site and twin status
+nestvars <- c("site_name","FamilyID")
+# Independent variables:
+indepvars <- paste0("SMA_RGFA",rep(1:8))
+# dependent variables:
+depvars <- c("kidsitotal","parsitotal")
+
+GFAselectLabel <- paste0("SMA_RGFA",rep(1:8))
+
+# Creating a data frame:
+glmmadmbdata <- currdata[complete.cases(currdata[,c(covars,nestvars,depvars,indepvars)]),c(covars,nestvars,depvars,indepvars)]
+
+# Visualizing missing data
+aggr(currdata[,c(covars,nestvars,depvars,indepvars)],col = c("blue","orange"),sortVars=TRUE,prop = FALSE, numbers = TRUE, combined = TRUE, cex.lab = 0.5, cex.axis =0.5, cex.numbers =0.5)
+
+mydepvar <- depvars[1]
+
+# Poisson Model with standard zero inflation:
+
+kidsi_cov_ZIP <- myglmmTMBall(mydepvar,"null",covars,nestvars,glmmadmbdata,"poisson",1)
+summary(kidsi_cov_ZIP)
+plot_model(kidsi_cov_ZIP,title = "ZIP Covariates: Youth Suicide Items, standard zero inflation")
+
+kidsi_sma_ZIP <- myglmmTMBall(mydepvar,indepvars,covars,nestvars,glmmadmbdata,"poisson",1)
+summary(kidsi_sma_ZIP)
+plot_model(kidsi_sma_ZIP,type="est",vline.color = "red",order.terms = c(1:48),show.values = TRUE,value.offset = .75,title = "ZIP Screen Media GFA: Total Youth Suicide Items, standard zero inflation")
+
+# With parameterized zero inflation coefficients:
+
+kidsi_cov_pZIP <- myglmmTMBall(mydepvar,"null",covars,nestvars,glmmadmbdata,"poisson",2)
+summary(kidsi_cov_pZIP)
+plot_model(kidsi_cov_ZIP,title = "ZIP Covariates: Youth Suicide Items, parameterized standard zero inflation")
+
+kidsi_sma_pZIP <- myglmmTMBall(mydepvar,indepvars,covars,nestvars,glmmadmbdata,"poisson",2)
+summary(kidsi_sma_pZIP)
+plot_model(kidsi_sma_ZIP,type="est",vline.color = "red",order.terms = c(1:48),show.values = TRUE,value.offset = .75,title = "ZIP Screen Media GFA: Total Youth Suicide Items, standard zero inflation")
+
+# Negative Binomial Model
+# Unfortunately the coefficient plot does not work with nbinom
+# could use a self-made plot from here:
+# https://github.com/glmmTMB/glmmTMB/blob/master/misc/salamanders.rmd
+# https://www.fromthebottomoftheheap.net/2017/05/04/compare-mgcv-with-glmmTMB/
+# without zero inflation coefficients:
+
+
+kidsi_cov_ZINB <- myglmmTMBall(mydepvar,"null",covars,nestvars,glmmadmbdata,"nbinom2",1)
+summary(kidsi_cov_ZINB)
+
+kidsi_sma_ZINB <- myglmmTMBall(mydepvar,indepvars,covars,nestvars,glmmadmbdata,"nbinom2",1)
+summary(kidsi_sma_ZIP)
+
+kidsi_sma_pZINB <- myglmmTMBall(mydepvar,indepvars,covars,nestvars,glmmadmbdata,"poisson",2)
+summary(kidsi_sma_pZIP)
+
+# Non zero-inflated models
+kidsi_sma_nZINB <- myglmmTMBall(mydepvar,indepvars,covars,nestvars,glmmadmbdata,"nbinom2",0)
+summary(kidsi_sma_nZINB)
+
+plot_model(kidsi_sma_nZINB,type="est",vline.color = "red",order.terms = c(1:24),show.values = TRUE,value.offset = .75,title = "nZINB Screen Media GFA: Total Youth Suicide Items, no zero inflation")
+
+kidsi_sma_nZIP <- myglmmTMBall(mydepvar,indepvars,covars,nestvars,glmmadmbdata,"poisson",0)
+summary(kidsi_sma_nZIP)
+
+plot_model(kidsi_sma_nZIP,type="est",vline.color = "red",order.terms = c(1:24),show.values = TRUE,value.offset = .75,title = "nZIP Screen Media GFA: Total Youth Suicide Items, no zero inflation")
+
+
+# Compare the AIC
+
+bictab <- BICtab(kidsi_cov_ZIP,
+                 kidsi_sma_ZIP,
+                 kidsi_cov_pZIP,
+                 kidsi_sma_pZIP,
+                 kidsi_cov_ZINB,
+                 kidsi_sma_ZINB,
+                 kidsi_sma_pZINB,
+                 kidsi_sma_nZIP,
+                 kidsi_sma_nZINB,logLik=TRUE,base=TRUE)
+
+tabAsStringMatrix <- print(bictab, printToggle = FALSE, noSpaces = TRUE)
+kable(tabAsStringMatrix, "html",caption = "Bayesian Information Criterion: Model Comparison") %>% kable_styling(bootstrap_options = c( "hover", "condensed", "responsive"),font_size = 11)
+
+# Plotting Results
+
+# Remove high variance variables:
+myremove <- c(1,20)
+
+# Forming different data frames for each model:
+dfmymodel <- createCoeftab(kidsi_sma_ZINB,"ZINB, standard zero inflation",c(GFAselectLabel,colabels),myremove)
+dfmymodel2 <- createCoeftab(kidsi_sma_pZINB,"ZINB, parameterized zero inflation",c(GFAselectLabel,colabels),myremove)
+dfmymodel3  <- createCoeftab(kidsi_sma_ZIP,"ZIP, standard zero inflation",c(GFAselectLabel,colabels),myremove)
+dfmymodel4  <- createCoeftab(kidsi_sma_nZINB,"ZINB, no zero inflation",c(GFAselectLabel,colabels),myremove)
+
+allmodels <- rbind(dfmymodel,dfmymodel2,dfmymodel3,dfmymodel4)
+
+# Plotting all models
+ggplot(allmodels, aes(x = estimate, y = term, colour = model, shape = model, xmax = upper, xmin = lower)) + theme_minimal() +
+  geom_vline(xintercept = 0, colour = "grey60", linetype = 2) +
+  
+    geom_pointrangeh(position = position_dodgev(height = 0.5)) +
+    labs(y = NULL,
+         x = "Regression estimate +/- CI",
+         title = "Zero Inflated Models")
+
+# Exponentiated Model
+ggplot(allmodels, aes(x = expestimate, y = term, colour = model, shape = model, xmax = expupper, xmin = explower)) + theme_minimal() +
+  geom_vline(xintercept = 1, colour = "grey60", linetype = 2) +
+  
+    geom_pointrangeh(position = position_dodgev(height = 0.5)) +
+    labs(y = NULL,
+         x = "Risk Ratio estimates +/- CI",
+         title = "Zero Inflated Models")
+
+
+# Plot best model
+ggplot(dfmymodel4, aes(x = estimate, y = term, xmax = upper, xmin = lower)) + theme_minimal() +
+  geom_vline(xintercept = 0, colour = "grey60", linetype = 2) +
+  geom_text(aes(label = format(estimate, digits=2, nsmall=2)),nudge_y = -0.3,nudge_x = 0.3,size = 3) +
+    geom_pointrangeh(position = position_dodgev(height = 0.5)) +
+    labs(y = NULL,
+         x = "Regression estimate +/- CI",
+         title = "Best Non-Zero Inflated Model: Negative Binomial")
+
+# Interpretation: https://stats.idre.ucla.edu/stata/output/negative-binomial-regression/
+# http://fmwww.bc.edu/ec-c/s2013/327/S5CountCategorical0511.slides.pdf
+# for a one unit change in the predictor variable, the difference in the logs of expected counts of the response variable is expected to change by the respective regression coefficient, given the other predictor variables in the model are held constant
+
+# Exponentiated Model
+ggplot(dfmymodel4, aes(x = expestimate, y = term, xmax = expupper, xmin = explower)) + theme_minimal() +
+  geom_vline(xintercept = 1, colour = "grey60", linetype = 2) +
+  geom_text(aes(label = format(expestimate, digits=2, nsmall=2)),nudge_y = -0.3,nudge_x = 0.3,size = 3) +
+    geom_pointrangeh(position = position_dodgev(height = 0.5)) +
+    labs(y = NULL,
+         x = "Risk Ratio estimates +/- CI",
+         title = "Best Non-Zero Inflated Model: Negative Binomial")
+
+# Interpretation: http://www.mathematica-journal.com/2013/06/negative-binomial-regression/
+# Incidence Rate Ratio (IRR) for each variable, which is obtained by exponentiating each coefficient
+
+# Plot a grid of effects:
+theme_set(theme_sjplot())
+plotlist <- list()
+depvars <- paste0("SMA_RGFA",rep(1:4))
+
+# Arrange the marginal plots in a grid of 4 without scatter plots:
+for(i in 1:length(depvars)){
+  p1 <- plot_model(kidsi_sma_nZINB,type = "pred",terms = c(depvars[i],"female"),title = "",axis.title = c(GFAselectLabel[i],"Youth Total SI Items"))
+  plotlist[[i]] <- p1
+  }
+mygridtitle <- paste("Marginal Plots: ",sep="")
+grid.arrange(plotlist[[1]],plotlist[[2]],plotlist[[3]],plotlist[[4]],ncol = 2,top=mygridtitle)
+
+# Arrange the marginal plots in a grid of 4 with scatter plots:
+for(i in 1:length(depvars)){
+  p1 <- plot_model(kidsi_sma_nZINB,type = "pred",terms = c(depvars[i],"female"),title = "",axis.title = c(GFAselectLabel[i],"Youth Total SI Items"),show.data = TRUE)
+  plotlist[[i]] <- p1
+}
+
+mygridtitle <- paste("Marginal Plots: ",sep="")
+grid.arrange(plotlist[[1]],plotlist[[2]],plotlist[[3]],plotlist[[4]],ncol = 2,top=mygridtitle)
+
+```
+
+This is the logistic regression with both site and family as a random effect.  Although there is an output and reasonable stastistics, the routine threw a warning about possible convergence problems.
+
+```{r, Logistic Regression with Gamm4, fig.height = 8, fig.width = 8, warning=FALSE}
+# Set up the variables:
+
+covars <- c("age","female","race.ethnicity","high.educ","married","HHInc","demo_prnt_age_v2")
+colabels <- c("Age","Female","Race: Black","Race: Hispanic","Race: Asian","Race: Other","Parental Education: HS","Parental Education: College","Parental Education: Bachelor","Parental Education: > Bachelor","Parental Education: missing","Married","Household Income: 50-100K","Household Income: > 100K","Household Income: miss","Parental Age")
+
+## Select the nesting variables: site and twin status
+nestvars <- c("site_name","FamilyID")
+# Independent variables:
+indepvars <- paste0("SMA_RGFA",rep(1:8))
+# dependent variables:
+depvars <- c("KidsSIyes","ParSIyes")
+
+GFAselectLabel <- paste0("SMA_RGFA",rep(1:8))
+
+# Creating a data frame:
+glmmadmbdata <- currdata[complete.cases(currdata[,c(covars,nestvars,depvars,indepvars)]),c(covars,nestvars,depvars,indepvars)]
+
+# Visualizing missing data
+aggr(currdata[,c(covars,nestvars,depvars,indepvars)],col = c("blue","orange"),sortVars=TRUE,prop = FALSE, numbers = TRUE, combined = TRUE, cex.lab = 0.5, cex.axis =0.5, cex.numbers =0.5)
+
+mydepvar <- c("KidsSIyes")
+
+# Compare the model with and without the GFAs:
+mygamm4base <- myGAMM4Bin(mydepvar,"null",covars,nestvars,glmmadmbdata)
+mygamm4GFA <- myGAMM4Bin(mydepvar,indepvars,covars,nestvars,glmmadmbdata)
+
+# Summary of logistic regression
+summary(mygamm4base$mer)
+summary(mygamm4base$gam)
+summary(mygamm4GFA$mer)
+summary(mygamm4GFA$gam)
+
+# Visualize the GAMM4 Coefficients:
+# https://cran.r-project.org/web/packages/merTools/vignettes/merToolsIntro.html
+
+feEx <- FEsim(mygamm4GFA$mer,1000)
+cbind(feEx[,1],round(feEx[,2:4],3))
+feEx$term <- c("Intercept",indepvars,colabels)
+feEx$term <- factor(feEx$term,levels = c("Intercept",indepvars,colabels))
+
+# reeduce the data for plotting:
+reddata <- feEx[feEx$term!= "Intercept" & feEx$term!= "Parental Education: missing", ]
+reddata <- droplevels(reddata)
+
+# theme_bw() + 
+gamm4coeff <- ggplot(reddata) + 
+  theme_minimal() +
+  aes(x = term, ymin = median - 1.96 * sd, 
+      ymax = median + 1.96 * sd, y = median) + 
+  geom_pointrange() + 
+  scale_x_discrete(limits = rev(levels(reddata$term))) +
+  geom_text(aes(label = sprintf("%0.2f", round(median, digits = 2))),
+                position=position_dodge(width=0.9), vjust=-0.75) +
+  geom_hline(yintercept = 0, size = I(1.1), color = I("red")) + 
+  coord_flip() + 
+  labs(title = paste("Kids SI Logistic Regression",": Median Effect Size",sep=""), 
+                    x = "Variables", y = "Standardized Coefficients")
+
+print(gamm4coeff)
+
+ExpfeEx <- data.frame(exp(feEx$mean),exp(feEx$median),exp(feEx$median-1.96*feEx$sd),exp(feEx$median+1.96*feEx$sd))
+
+ExpfeEx <- data.frame(cbind(feEx$term,ExpfeEx))
+
+colnames(ExpfeEx) <- c("term","mean","median","Lower_CI","Upper_CI")
+ExpfeEx$term = factor(ExpfeEx$term,levels = c("Intercept",indepvars,colabels))
+
+reddata <- ExpfeEx[ExpfeEx$term!= "Intercept" & ExpfeEx$term!= "Parental Education: missing", ]
+reddata <- droplevels(reddata)
+
+# theme_bw() +                      
+# Exponentiated Results:
+gamm4coeff <- ggplot(reddata) + 
+  theme_minimal() +
+  aes(x = term, ymin = Lower_CI, 
+      ymax = Upper_CI, y = median) + 
+  geom_pointrange() + 
+  scale_x_discrete(limits = rev(levels(reddata$term))) +
+  geom_text(aes(label = sprintf("%0.2f", round(median, digits = 2))),
+                position=position_dodge(width=0.9), vjust=-0.75) +
+  geom_hline(yintercept = 1, size = I(1.1), color = I("red")) + 
+  coord_flip() + 
+   labs(title = paste("Kids Sucidal Ideation",": Odds Ratios",sep=""), 
+                    x = "Variables", y = "Risk Ratio estimates +/- CI")
+
+print(gamm4coeff)
+
+```
+
+This is the logistic Regression with site only as the random effect because there were some convergence problems when including both site and family as a random effect.
+
+```{r, Logistic Regression with Gamm4 site only random effect, fig.height = 8, fig.width = 8, warning=FALSE}
+# Set up the variables:
+
+covars <- c("age","female","race.ethnicity","high.educ","married","HHInc","demo_prnt_age_v2")
+colabels <- c("Age","Female","Race: Black","Race: Hispanic","Race: Asian","Race: Other","Parental Education: HS","Parental Education: College","Parental Education: Bachelor","Parental Education: > Bachelor","Parental Education: missing","Married","Household Income: 50-100K","Household Income: > 100K","Household Income: miss","Parental Age")
+
+## Select the nesting variables: site and twin status
+nestvars <- c("site_name")
+# Independent variables:
+indepvars <- paste0("SMA_RGFA",rep(1:8))
+# dependent variables:
+depvars <- c("KidsSIyes","ParSIyes")
+
+GFAselectLabel <- paste0("SMA_RGFA",rep(1:8))
+
+# Creating a data frame:
+glmmadmbdata <- currdata[complete.cases(currdata[,c(covars,nestvars,depvars,indepvars)]),c(covars,nestvars,depvars,indepvars)]
+
+# Visualizing missing data
+aggr(currdata[,c(covars,nestvars,depvars,indepvars)],col = c("blue","orange"),sortVars=TRUE,prop = FALSE, numbers = TRUE, combined = TRUE, cex.lab = 0.5, cex.axis =0.5, cex.numbers =0.5)
+
+mydepvar <- c("KidsSIyes")
+
+# Compare the model with and without the GFAs:
+mygamm4base <- myGAMM4Bin(mydepvar,"null",covars,nestvars,glmmadmbdata)
+mygamm4GFA <- myGAMM4Bin(mydepvar,indepvars,covars,nestvars,glmmadmbdata)
+
+# Summary of logistic regression
+summary(mygamm4base$mer)
+summary(mygamm4base$gam)
+summary(mygamm4GFA$mer)
+summary(mygamm4GFA$gam)
+
+# Visualize the GAMM4 Coefficients:
+# https://cran.r-project.org/web/packages/merTools/vignettes/merToolsIntro.html
+
+feEx <- FEsim(mygamm4GFA$mer,1000)
+cbind(feEx[,1],round(feEx[,2:4],3))
+feEx$term <- c("Intercept",indepvars,colabels)
+feEx$term <- factor(feEx$term,levels = c("Intercept",indepvars,colabels))
+
+# reeduce the data for plotting:
+reddata <- feEx[feEx$term!= "Intercept" & feEx$term!= "Parental Education: missing", ]
+reddata <- droplevels(reddata)
+
+# theme_bw() + 
+gamm4coeff <- ggplot(reddata) + 
+  theme_minimal() +
+  aes(x = term, ymin = median - 1.96 * sd, 
+      ymax = median + 1.96 * sd, y = median) + 
+  geom_pointrange() + 
+  scale_x_discrete(limits = rev(levels(reddata$term))) +
+  geom_text(aes(label = sprintf("%0.2f", round(median, digits = 2))),
+                position=position_dodge(width=0.9), vjust=-0.75) +
+  geom_hline(yintercept = 0, size = I(1.1), color = I("red")) + 
+  coord_flip() + 
+  labs(title = paste("Kids SI Logistic Regression",": Median Effect Size",sep=""), 
+                    x = "Variables", y = "Standardized Coefficients")
+
+print(gamm4coeff)
+
+ExpfeEx <- data.frame(exp(feEx$mean),exp(feEx$median),exp(feEx$median-1.96*feEx$sd),exp(feEx$median+1.96*feEx$sd))
+
+ExpfeEx <- data.frame(cbind(feEx$term,ExpfeEx))
+
+colnames(ExpfeEx) <- c("term","mean","median","Lower_CI","Upper_CI")
+ExpfeEx$term = factor(ExpfeEx$term,levels = c("Intercept",indepvars,colabels))
+
+reddata <- ExpfeEx[ExpfeEx$term!= "Intercept" & ExpfeEx$term!= "Parental Education: missing", ]
+reddata <- droplevels(reddata)
+
+# theme_bw() +                      
+# Exponentiated Results:
+gamm4coeff <- ggplot(reddata) + 
+  theme_minimal() +
+  aes(x = term, ymin = Lower_CI, 
+      ymax = Upper_CI, y = median) + 
+  geom_pointrange() + 
+  scale_x_discrete(limits = rev(levels(reddata$term))) +
+  geom_text(aes(label = sprintf("%0.2f", round(median, digits = 2))),
+                position=position_dodge(width=0.9), vjust=-0.75) +
+  geom_hline(yintercept = 1, size = I(1.1), color = I("red")) + 
+  coord_flip() + 
+   labs(title = paste("Kids Sucidal Ideation",": Odds Ratios",sep=""), 
+                    x = "Variables", y = "Risk Ratio estimates +/- CI")
+
+print(gamm4coeff)
+
+```
+
+These are bar plots of the SMA variables by GFA standard deviations
+
+```{r barplots by GFA standard deviation, message = FALSE}
+# This is based on tabledata, which was generated by the standard deviation variable
+# of the GFAs
+# Pick the color based on: https://htmlcolorcodes.com/color-picker/
+
+tabledata <- currdata[,c(mysdGFA,listvars)]
+
+tablenames <- names(tabledata)
+mysmas <- tablenames[grep("_y_",tablenames)]
+mysmalabels <- c("Watching TV/Movies per week [h]","Watching Videos per week [h]","Playing Games per week [h]","Texting per week [h]","Social Networking per week [h]","Chatting per week [h]")
+
+for (i in 1:8){
+  p <- list()
+  for (j in 1: length(mysmas)){
+  myplotGFA <- paste0("sdGFA",i)
+completetabledata <- tabledata[complete.cases(tabledata[,c(myplotGFA)]),]
+
+p[[j]] <-ggplot(data=completetabledata, aes_string(x=myplotGFA, y=mysmas[j])) +
+  geom_bar(stat = "summary", fun.y = "mean",fill="#FF3396") + coord_flip() + 
+  # ggtitle("Media Activity and GFA") +
+  ylim(0, 22) +
+  stat_summary(aes(label=round(..y..,2)), fun.y=mean, geom="text", size=3,
+             color = "black",hjust=-0.1) +
+  xlab(paste0("GFA",i)) + ylab(mysmalabels[j])  + theme_minimal()
+# print(p[[i]])
+  }
+  do.call("grid.arrange", c(p,list(ncol=2, top=textGrob(paste0("GFA ",i)))))
+# do.call(grid.arrange,c(p,main="text"))
+}
+
+
+for (j in 1: length(mysmas)){
+p <- list()
+for (i in 1:4){
+  myplotGFA <- paste0("sdGFA",i)
+completetabledata <- tabledata[complete.cases(tabledata[,c(myplotGFA)]),]
+
+p[[i]] <-ggplot(data=completetabledata, aes_string(x=myplotGFA, y=mysmas[j])) +
+  geom_bar(stat = "summary", fun.y = "mean",fill="skyblue") + coord_flip() + 
+  # ggtitle("Media Activity and GFA") +
+  ylim(0, 22) +
+  stat_summary(aes(label=round(..y..,2)), fun.y=mean, geom="text", size=3,
+             color = "black",hjust=-0.1) +
+  xlab(paste0("GFA",i)) + ylab(mysmalabels[j])  + theme_minimal()
+# print(p[[i]])
+}
+do.call("grid.arrange", c(p,list(ncol=2, top=textGrob(paste0("GFA Groups and ",mysmalabels[j])))))
+# do.call(grid.arrange,p)
+}
+
+```
+
+These are barplots by GFA of the SMA by quartiles.
+
+```{r barplots by GFA quartiles, message=FALSE}
+# This is based on tabledata, which was generated by the standard deviation variable
+# of the GFAs
+# Pick the color based on: https://htmlcolorcodes.com/color-picker/
+
+tabledata <- currdata[,c(myqGFA,listvars)]
+
+tablenames <- names(tabledata)
+mysmas <- tablenames[grep("_y_",tablenames)]
+mysmalabels <- c("Watching TV/Movies per week [h]","Watching Videos per week [h]","Playing Games per week [h]","Texting per week [h]","Social Networking per week [h]","Chatting per week [h]")
+
+for (i in 1:8){
+  p <- list()
+  for (j in 1: length(mysmas)){
+  myplotGFA <- paste0("qGFA",i)
+completetabledata <- tabledata[complete.cases(tabledata[,c(myplotGFA)]),]
+
+p[[j]] <-ggplot(data=completetabledata, aes_string(x=myplotGFA, y=mysmas[j])) +
+  geom_bar(stat = "summary", fun.y = "mean",fill="#FF3396") + coord_flip() + 
+  # ggtitle("Media Activity and GFA") +
+  ylim(0, 22) +
+  stat_summary(aes(label=round(..y..,2)), fun.y=mean, geom="text", size=3,
+             color = "black",hjust=-0.1) +
+  xlab(paste0("GFA",i)) + ylab(mysmalabels[j])  + theme_minimal()
+# print(p[[i]])
+  }
+  do.call("grid.arrange", c(p,list(ncol=2, top=textGrob(paste0("GFA ",i)))))
+# do.call(grid.arrange,c(p,main="text"))
+}
+
+
+for (j in 1: length(mysmas)){
+p <- list()
+for (i in 1:4){
+  myplotGFA <- paste0("qGFA",i)
+completetabledata <- tabledata[complete.cases(tabledata[,c(myplotGFA)]),]
+
+p[[i]] <-ggplot(data=completetabledata, aes_string(x=myplotGFA, y=mysmas[j])) +
+  geom_bar(stat = "summary", fun.y = "mean",fill="skyblue") + coord_flip() + 
+  # ggtitle("Media Activity and GFA") +
+  ylim(0, 22) +
+  stat_summary(aes(label=round(..y..,2)), fun.y=mean, geom="text", size=3,
+             color = "black",hjust=-0.1) +
+  xlab(paste0("GFA",i)) + ylab(mysmalabels[j])  + theme_minimal()
+# print(p[[i]])
+}
+do.call("grid.arrange", c(p,list(ncol=2, top=textGrob(paste0("GFA Quartiles and ",mysmalabels[j])))))
+# do.call(grid.arrange,p)
+}
+
+```
